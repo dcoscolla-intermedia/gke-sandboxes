@@ -43,6 +43,89 @@ await sandboxes.sleep(sandbox.id);
 
 [Full client guide](docs/client.md)
 
+## Small trial
+
+This fork defaults to the smallest cluster that runs the whole lifecycle, sized for a Google Cloud Free Trial project, which caps CPU quota and cannot raise it. It is a zonal cluster in `us-central1-a` with:
+
+| Pool | Machine | Nodes | vCPU at max |
+| --- | --- | --- | --- |
+| System | `e2-standard-2`, 50 GB disk | 1 to 2 | 4 |
+| Sandboxes (gVisor) | `e2-highmem-4`, 100 GB disk | 1 (`max_sandbox_nodes`) | 4 |
+| Total | | | 8 |
+
+Node upgrades run without a surge node, so an upgrade never needs a ninth vCPU. The headroom placeholder is off (`headroom_replicas = 0`).
+
+### Capacity
+
+One `e2-highmem-4` node has 4 vCPU and 32 GiB. After GKE's reservations it leaves 3.92 vCPU, about 28.2 GiB of memory and 49 GiB of boot disk for pods ([node sizing](https://cloud.google.com/kubernetes-engine/docs/concepts/plan-node-sizes), [Image streaming reservation](https://cloud.google.com/kubernetes-engine/docs/how-to/image-streaming)). GKE's DaemonSets take an estimated 0.4 vCPU and 0.75 GiB more. Check the real numbers with `kubectl describe node`.
+
+| Sandbox size (requests) | Limited by | Per node |
+| --- | --- | --- |
+| Client default: 250m CPU, 1 GiB, 4 GiB disk | Disk: 49 / 4 | 12 |
+| Coding agent: 500m CPU, 4 GiB, 8 GiB disk | Memory: 27.4 / 4, and disk: 49 / 8 | 6 |
+
+The default size lets 12 sandboxes share 27 GiB while each may use 4 GiB, so busy agents can run the node out of memory. For agents, pass the second size, whose memory request equals its limit:
+
+```ts
+resources: {
+  requests: { cpu: '500m', memory: '4Gi', 'ephemeral-storage': '8Gi' },
+  limits: { cpu: '2', memory: '4Gi', 'ephemeral-storage': '20Gi' },
+},
+```
+
+### Cost
+
+Estimated at on-demand list prices in `us-central1` for the minimum of one system node and one sandbox node:
+
+| Item | USD per hour |
+| --- | --- |
+| `e2-standard-2` ([VM pricing](https://cloud.google.com/compute/vm-instance-pricing#e2_machine_types)) | 0.067 |
+| `e2-highmem-4` | 0.181 |
+| 150 GB balanced disk at $0.10 per GB-month ([disk pricing](https://cloud.google.com/compute/disks-image-pricing)) | 0.021 |
+| Cloud NAT for 2 VMs plus its IP ([NAT pricing](https://cloud.google.com/nat/pricing)) | 0.008, plus $0.045 per GB processed |
+| Cluster fee ([GKE pricing](https://cloud.google.com/kubernetes-engine/pricing)) | 0.10, covered by the free tier credit for one zonal cluster per billing account |
+| Total | about 0.28 (0.38 without the credit, 0.35 with a second system node) |
+
+A 4-hour test costs about $1.10 to $1.50 plus egress. Snapshot storage and logs stay under a cent at this size. These are estimates. Check them against the pricing pages before you start.
+
+### Egress stays open
+
+Sandboxes can reach any public address through Cloud NAT. Only SMTP ports are blocked. The network policy blocks private ranges and the metadata server, not the internet. Agents need egress for git, package registries and model APIs, so a test sandbox can also send data anywhere. Run only code you would run on a laptop with internet access.
+
+### Run a 4-hour test
+
+Do it all on the same day.
+
+1. Create a new project in a Free Trial billing account. Name it, for example, `my-trial-project`. Check its CPU and SSD quota on the console's Quotas page.
+2. Add a budget alert on that billing account, for example $10 with alerts at 50%, 90% and 100% ([budgets](https://cloud.google.com/billing/docs/how-to/budgets)). An alert does not stop spending, so keep the destroy step.
+3. Deploy, following [docs/deploy.md](docs/deploy.md):
+
+   ```sh
+   export TF_VAR_project_id=my-trial-project
+   export TF_VAR_operator_member=user:you@example.com
+   terraform -chdir=infra init
+   terraform -chdir=infra apply
+   ```
+
+4. Get credentials with `--location us-central1-a` and apply the manifests.
+5. Run `bun examples/verify.ts` with the endpoint and controller outputs. It creates a sandbox, writes a file, puts it to sleep, wakes it and checks the file.
+6. Check sleep and wake by hand. Acquire a sandbox, leave it idle for more than five minutes, and confirm the sweeper's log shows `sandbox_sweep` and the pod is gone (`kubectl logs -n sandbox-system deploy/sandbox-sweeper`, `kubectl get pods,podsnapshots -n sandboxes`). Acquire it again and read the file back.
+7. Tear down:
+
+   ```sh
+   terraform -chdir=infra output -raw manifests | kubectl delete --ignore-not-found -f -
+   TF_VAR_deletion_protection=false terraform -chdir=infra apply
+   TF_VAR_deletion_protection=false terraform -chdir=infra destroy
+   gcloud container clusters list --project my-trial-project
+   gcloud compute disks list --project my-trial-project
+   ```
+
+`deletion_protection` defaults to `true`, so a stray `destroy` fails. The apply in step 7 turns it off first. The snapshot bucket must be empty before `destroy` can delete it.
+
+The sweeper installs the client with `npm ci` from `infra/sweeper/package-lock.json`, so a new npm release cannot change what runs in the cluster. Update the lockfile to upgrade it.
+
+`.github/workflows/terraform-validate.yml` checks formatting, validates the configuration and plans it against a mocked provider (`infra/tests/plan.tftest.hcl`). It uses no Google Cloud credentials.
+
 ## Features
 
 - **Sleep and wake.** A sleeping sandbox is a snapshot in Cloud Storage and uses no CPU or memory. Opening its ID wakes it with its files.

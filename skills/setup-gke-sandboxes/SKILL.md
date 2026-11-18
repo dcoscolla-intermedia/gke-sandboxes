@@ -22,10 +22,11 @@ Get these before running anything:
 | --- | --- | --- |
 | Google Cloud project ID | `TF_VAR_project_id` | Billing must be enabled. |
 | Region | `TF_VAR_region` | Default `us-central1`. It must support GKE Pod snapshots with gVisor. |
+| Zone | `TF_VAR_zone` | Default `us-central1-a`. It must be in the region. The cluster is zonal, so GKE's free tier credit covers its fee. |
 | Their Google account or group | `TF_VAR_operator_member` | Form `user:name@example.com`. It may impersonate the controller service account. |
-| Most sandbox machines to run | `TF_VAR_max_sandbox_nodes` | `3` is enough to try it. |
+| Most sandbox machines to run | `TF_VAR_max_sandbox_nodes` | Default `1`, which keeps the cluster within 8 vCPU. |
 
-Tell them what it costs while it runs, at Iowa list prices: one `e2-highmem-16` sandbox machine at about $0.72 an hour, one `e2-standard-4` system machine at about $0.13, the cluster fee at $0.10, plus disks and Cloud NAT. That is roughly $1 an hour, or about $25 a day, until they tear it down.
+Tell them what it costs while it runs, at Iowa list prices: one `e2-highmem-4` sandbox machine at about $0.18 an hour, one `e2-standard-2` system machine at about $0.07, plus disks and Cloud NAT. The free tier credit covers the $0.10 cluster fee for one zonal cluster per billing account. That is roughly $0.28 an hour, or about $7 a day, until they tear it down. See "Small trial" in the README.
 
 ## 2. Check the tools
 
@@ -46,12 +47,12 @@ If a tool is missing, tell the user how to install it and wait. If either creden
 The Terraform and the verifier live in the repository. If you are not already in a checkout of it, get one, then run everything from its root in one shell so the variables carry over.
 
 ```sh
-git clone https://github.com/comp-work/gke-sandboxes && cd gke-sandboxes
+# git clone <this repository's URL> && cd gke-sandboxes
 
 export TF_VAR_project_id=<project>
 export TF_VAR_operator_member=user:<email>
 export TF_VAR_region=us-central1
-export TF_VAR_max_sandbox_nodes=3
+export TF_VAR_zone=us-central1-a
 
 bun install
 terraform -chdir=infra init
@@ -64,11 +65,11 @@ Show the user the plan summary and get their go-ahead, then:
 terraform -chdir=infra apply
 export KUBECONFIG="$(mktemp)"
 gcloud container clusters get-credentials sandboxes --dns-endpoint \
-  --project="$TF_VAR_project_id" --region="$TF_VAR_region"
+  --project="$TF_VAR_project_id" --location="$TF_VAR_zone"
 terraform -chdir=infra output -raw manifests | kubectl apply -f -
 ```
 
-`apply` takes 10 to 15 minutes. It creates the cluster, a system node pool and a gVisor sandbox node pool, a private network with Cloud NAT, a snapshot bucket, and a controller service account. The manifests add the `sandboxes` namespace, network policies, the snapshot policy, access for the controller, a placeholder pod that keeps spare capacity, and a sweeper in `sandbox-system` that puts idle sandboxes to sleep.
+`apply` takes 10 to 15 minutes. It creates the cluster, a system node pool and a gVisor sandbox node pool, a private network with Cloud NAT, a snapshot bucket, and a controller service account. The manifests add the `sandboxes` namespace, network policies, the snapshot policy, access for the controller, a placeholder deployment that can keep spare capacity (0 replicas by default), and a sweeper in `sandbox-system` that puts idle sandboxes to sleep.
 
 Use the separate `KUBECONFIG` as shown. It keeps the user's own kubectl contexts untouched.
 
@@ -129,10 +130,10 @@ Keep these in mind when choosing an image and writing to the sandbox:
 
 ## 6. Size it for real use (optional)
 
-The defaults are `e2-highmem-16` machines with sandboxes that reserve 0.25 vCPU and 1 GiB, about 64 per machine. For faster machines and denser packing, see "Deploy on C4D" in [docs/deploy.md](../../docs/deploy.md#deploy-on-c4d). Three things to tell the user first:
+The defaults are one `e2-highmem-4` machine with sandboxes that reserve 0.25 vCPU, 1 GiB and 4 GiB of disk, about 12 per machine, or 6 agent-sized ones (see "Small trial" in the README). For faster machines and denser packing, see "Deploy on C4D" in [docs/deploy.md](../../docs/deploy.md#deploy-on-c4d). Three things to tell the user first:
 
 - Newer machine families can be out of stock in a zone. Check that a machine can be created before committing to one.
-- Packing more than about 100 sandboxes on a machine needs `TF_VAR_sandbox_max_pods_per_node` above the default 110.
+- Packing more than about 100 sandboxes on a machine needs `TF_VAR_sandbox_max_pods_per_node` above the default 32.
 - Memory is the limit to watch. A node that runs out evicts sandboxes, and they come back from their last snapshot.
 
 ## If something fails
@@ -153,7 +154,8 @@ Ask first. This deletes every sandbox and snapshot.
 ```sh
 kubectl get pods,podsnapshots -n sandboxes
 terraform -chdir=infra output -raw manifests | kubectl delete --ignore-not-found -f -
-terraform -chdir=infra destroy
+TF_VAR_deletion_protection=false terraform -chdir=infra apply
+TF_VAR_deletion_protection=false terraform -chdir=infra destroy
 ```
 
-The snapshot bucket must be empty before Terraform can delete it. Keep the Terraform state until `destroy` finishes. Afterwards, confirm with `gcloud container clusters list --project "$TF_VAR_project_id"` that the cluster is gone.
+Deletion protection is on by default, so the first command turns it off before `destroy`. The snapshot bucket must be empty before Terraform can delete it. Keep the Terraform state until `destroy` finishes. Afterwards, confirm with `gcloud container clusters list --project "$TF_VAR_project_id"` that the cluster is gone.
