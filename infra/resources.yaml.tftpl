@@ -141,7 +141,7 @@ metadata:
   namespace: sandboxes
   name: sandbox-headroom
 spec:
-  replicas: 1
+  replicas: ${headroom_replicas}
   selector:
     matchLabels:
       app: sandbox-headroom
@@ -160,14 +160,15 @@ spec:
           image: docker.io/library/debian:bookworm-slim
           command: [sleep, infinity]
           resources:
+            # One agent-sized sandbox. Four full vCPU would never fit on an e2-highmem-4 node.
             requests:
-              cpu: '4'
-              memory: 16Gi
-              ephemeral-storage: 64Gi
+              cpu: 500m
+              memory: 4Gi
+              ephemeral-storage: 8Gi
             limits:
-              cpu: '4'
-              memory: 16Gi
-              ephemeral-storage: 64Gi
+              cpu: 500m
+              memory: 4Gi
+              ephemeral-storage: 8Gi
 ---
 # What runs beside the sandboxes. The sandboxes namespace denies its pods all traffic by default,
 # so the cluster's own helpers live here.
@@ -190,6 +191,10 @@ metadata:
   namespace: sandbox-system
   name: sandbox-sweeper
 data:
+  package.json: |
+    ${sweeper_package_json}
+  package-lock.json: |
+    ${sweeper_package_lock}
   sweeper.mjs: |
     // Puts sandboxes to sleep once nothing has used them for the idle time. A sandbox only sleeps
     // when something asks, and this asks once a minute.
@@ -261,10 +266,8 @@ spec:
           command:
             - sh
             - -c
-            - cd /work && cp /sweeper/sweeper.mjs . && npm install --no-audit --no-fund --silent "$PACKAGE" && exec node sweeper.mjs
+            - cd /work && cp /sweeper/package.json /sweeper/package-lock.json /sweeper/sweeper.mjs . && npm ci --ignore-scripts --no-audit --no-fund --silent && exec node sweeper.mjs
           env:
-            - name: PACKAGE
-              value: '${sweeper_package}'
             - name: IDLE_TIMEOUT_MS
               value: '${sweeper_idle_ms}'
             - name: HOME
