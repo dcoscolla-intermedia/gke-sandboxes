@@ -1,0 +1,49 @@
+name: terraform-validate
+
+on:
+  pull_request:
+  push:
+    branches: [main, small-trial]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: fmt
+        run: terraform fmt -check -recursive
+
+      - name: init
+        run: terraform init -backend=false -input=false
+
+      - name: validate
+        run: terraform validate
+
+      # A real plan against a mocked google provider. It creates nothing and needs no credentials.
+      - name: plan (mocked provider)
+        run: terraform test
+
+      # A plain plan needs Google credentials, because data.google_project reads the project
+      # during every plan, even with -refresh=false. This repository holds no credentials, so the
+      # step runs with a dummy token and is allowed to fail. The mocked plan above is the gate.
+      - name: plan (real provider, no credentials, allowed to fail)
+        continue-on-error: true
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: dummy-not-a-credential
+        run: |
+          terraform plan -refresh=false -input=false -lock=false \
+            -var project_id=my-trial-project \
+            -var operator_member=user:you@example.com
