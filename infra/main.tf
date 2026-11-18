@@ -13,6 +13,20 @@ variable "region" {
   type    = string
   default = "us-central1"
 }
+variable "zone" {
+  type        = string
+  default     = "us-central1-a"
+  description = "Zone for the cluster and its nodes. A zonal cluster qualifies for GKE's free tier credit, which covers the management fee of one zonal or Autopilot cluster per billing account."
+  validation {
+    condition     = startswith(var.zone, "${var.region}-")
+    error_message = "The zone must be inside var.region."
+  }
+}
+variable "deletion_protection" {
+  type        = bool
+  default     = true
+  description = "Blocks terraform destroy of the cluster. Set it to false and apply once before you destroy."
+}
 variable "name_suffix" {
   type        = string
   default     = ""
@@ -28,14 +42,9 @@ variable "sweeper_idle_seconds" {
   default     = 300
   description = "How long a sandbox goes unused before the sweeper puts it to sleep. Match the client's idleTimeoutMs."
 }
-variable "sweeper_package" {
-  type        = string
-  default     = "@getenergy/gke-sandboxes@0.3.0"
-  description = "The client package the sweeper installs. Keep it at the version your backend uses."
-}
 variable "sandbox_machine_type" {
   type        = string
-  default     = "e2-highmem-16"
+  default     = "e2-highmem-4"
   description = "Machine type for sandbox nodes. Newer families such as c4d-highmem-16 need sandbox_node_disk_type = \"hyperdisk-balanced\"."
 }
 variable "sandbox_node_disk_type" {
@@ -44,22 +53,28 @@ variable "sandbox_node_disk_type" {
 }
 variable "sandbox_max_pods_per_node" {
   type        = number
-  default     = 110
-  description = "Pods a sandbox node may hold, system pods included. Raise it to pack more than about 100 sandboxes on a node."
+  default     = 32
+  description = "Pods a sandbox node may hold, system pods included. On GKE 1.37.2 and later a lower value also lowers the node's memory reservation."
 }
 variable "sandbox_node_disk_gb" {
   type        = number
-  default     = 150
+  default     = 100
   description = "Balanced boot disk per sandbox node. Increase for denser packing and workloads with more scratch data."
 }
 
 variable "max_sandbox_nodes" {
   type        = number
-  description = "Autoscaling ceiling for this deployment. Size for your workload and regional quota."
+  default     = 1
+  description = "Autoscaling ceiling for this deployment. Size for your workload and regional quota. With the defaults the cluster peaks at 2 system nodes x 2 vCPU + this x 4 vCPU, so 1 keeps it at the free trial's 8 vCPU."
   validation {
     condition     = var.max_sandbox_nodes >= 1 && floor(var.max_sandbox_nodes) == var.max_sandbox_nodes
     error_message = "Supply a positive whole number of nodes."
   }
+}
+variable "headroom_replicas" {
+  type        = number
+  default     = 0
+  description = "Placeholder pods that keep one sandbox's worth of capacity free. Each one holds a slot on a small node, so the trial runs without them."
 }
 variable "operator_member" {
   type        = string
@@ -178,17 +193,20 @@ resource "google_project_iam_member" "sandbox_nodes" {
 
 resource "google_container_cluster" "sandboxes" {
   name                = "sandboxes${var.name_suffix}"
-  deletion_protection = false
-  location            = var.region
+  deletion_protection = var.deletion_protection
+  location            = var.zone
   network             = google_compute_network.sandboxes.id
   subnetwork          = google_compute_subnetwork.sandboxes.id
   project             = var.project_id
 
   initial_node_count       = 1
   remove_default_node_pool = true
+  # The default pool exists only while the cluster is created. A small disk keeps it inside the
+  # trial's SSD quota.
   node_config {
     service_account = google_service_account.sandbox_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+    disk_size_gb    = 50
   }
   # Once the first node pool is removed, GKE reports another pool's settings here. Without this,
   # every later apply would replace the cluster.
@@ -243,15 +261,22 @@ resource "google_container_node_pool" "sandbox_system" {
   name     = "system"
   cluster  = google_container_cluster.sandboxes.id
   project  = var.project_id
-  location = var.region
+  location = var.zone
 
   autoscaling {
     total_min_node_count = 1
-    total_max_node_count = 9
+    total_max_node_count = 2
+  }
+
+  # Upgrade in place, without a surge node, so the cluster never goes over its vCPU quota.
+  upgrade_settings {
+    max_surge       = 0
+    max_unavailable = 1
   }
 
   node_config {
-    machine_type    = "e2-standard-4"
+    machine_type    = "e2-standard-2"
+    disk_size_gb    = 50
     service_account = google_service_account.sandbox_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
@@ -265,12 +290,17 @@ resource "google_container_node_pool" "sandboxes" {
   name     = "sandboxes"
   cluster  = google_container_cluster.sandboxes.id
   project  = var.project_id
-  location = var.region
+  location = var.zone
 
   autoscaling {
     total_min_node_count = 1
     total_max_node_count = var.max_sandbox_nodes
     location_policy      = "ANY"
+  }
+
+  upgrade_settings {
+    max_surge       = 0
+    max_unavailable = 1
   }
 
   max_pods_per_node = var.sandbox_max_pods_per_node
@@ -358,10 +388,13 @@ output "endpoint" {
 }
 output "manifests" {
   value = templatefile("${path.module}/resources.yaml.tftpl", {
-    bucket           = google_storage_bucket.sandbox_snapshots.name
-    controller       = google_service_account.controller.email
-    sweeper_replicas = var.sweeper_enabled ? 1 : 0
-    sweeper_idle_ms  = var.sweeper_idle_seconds * 1000
-    sweeper_package  = var.sweeper_package
+    bucket            = google_storage_bucket.sandbox_snapshots.name
+    controller        = google_service_account.controller.email
+    headroom_replicas = var.headroom_replicas
+    sweeper_replicas  = var.sweeper_enabled ? 1 : 0
+    sweeper_idle_ms   = var.sweeper_idle_seconds * 1000
+    # The sweeper installs exactly what this lockfile names, with npm ci.
+    sweeper_package_json = indent(4, file("${path.module}/sweeper/package.json"))
+    sweeper_package_lock = indent(4, file("${path.module}/sweeper/package-lock.json"))
   })
 }

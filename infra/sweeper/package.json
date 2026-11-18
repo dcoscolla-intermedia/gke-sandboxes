@@ -1,0 +1,7 @@
+{
+  "name": "gke-sandboxes-sweeper",
+  "private": true,
+  "dependencies": {
+    "@getenergy/gke-sandboxes": "0.3.0"
+  }
+}
